@@ -139,8 +139,11 @@ would be pushed without pushing anything.
   with `peers approve` in a terminal. `replies`: answers to that session's own
   messages arrive directly. `auto`: everything arrives directly, at most 6 an
   hour per sender. `off`: refused.
-- Approving and changing these settings refuse to run inside Claude Code: they
-  are decisions for the person.
+- Approving is the person's decision. Three ways: the pop-up (macOS), `peers approve
+  <id>` in a terminal, or telling your own Claude in the session ("approve the
+  message from ann"). In the last case the tool checks Claude Code's own record
+  that you typed it, after the message arrived and within the last 30 minutes;
+  Claude cannot approve on its own. `peers inbound` only works in a terminal.
 - A delivered message tells the receiving Claude who sent it, that it is from a
   different person, and how to answer. Messages cannot approve permission prompts.
 - Unapproved messages expire after a day. Messages are limited to 8,000 characters.
