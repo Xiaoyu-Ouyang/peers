@@ -41,8 +41,13 @@ Their files land in `~/peers/their-project/code`, their shared sessions in
 `~/peers/their-project/sessions`, and both stay current. `peers invite` prints
 these lines with the right addresses filled in.
 
-Needs macOS or Linux, git, Python 3.9+ (the one shipped with macOS works). The
-background service and the approval pop-up are macOS only for now.
+Needs macOS or Linux, git, Python 3.9+ (the one shipped with macOS works).
+The background sync installs as a launchd agent on macOS and a systemd user service on Linux.
+The approval pop-up is macOS only. On Linux, or on a machine you reach over ssh, a waiting
+message is announced three ways: in Claude Code's status line, as a notification through
+your terminal app (iTerm2, kitty, WezTerm and Ghostty show it on your own computer), and
+as a desktop notification if the machine has a desktop. You then decide in a terminal:
+`peers inbox`, `peers approve <id>`.
 
 ## Everyday use
 

@@ -28,7 +28,7 @@ CONFIG = os.path.join(PEERS_HOME, "config.json")
 STATE = os.path.join(PEERS_HOME, "state.json")
 LOG = os.path.join(PEERS_HOME, "daemon.log")
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 LABEL = "com.peers.sync"  # launchd label of the background sync
 
 PART_MAX = 200_000      # characters per part file before rolling to the next
@@ -1034,10 +1034,65 @@ def deliver(sock_path, text):
         s.close()
 
 
+def login_ttys():
+    """Terminals the person is logged in on, for example over ssh (not the pseudo-terminals programs make for themselves)."""
+    import getpass
+    out = []
+    try:
+        who = subprocess.run(["who"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return out
+    me = getpass.getuser()
+    for line in who.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == me and re.match(r"^(pts/\d+|ttys?\w+)$", parts[1]):
+            dev = "/dev/" + parts[1]
+            if os.path.exists(dev) and os.access(dev, os.W_OK) and dev not in out:
+                out.append(dev)
+    return out
+
+
+def pending_summary(inbox):
+    """One line about messages that wait for approval: who sent them, never what they say."""
+    waiting = [e for e in inbox.values() if e.get("status") == "pending"]
+    if not waiting:
+        return ""
+    senders = ", ".join(sorted({e["msg"]["from"] for e in waiting}))
+    return (f"peers: {len(waiting)} message{'s' if len(waiting) > 1 else ''} from {senders} "
+            f"wait{'' if len(waiting) > 1 else 's'} for your approval. In a terminal: peers inbox")
+
+
+def remind_without_dialog(inbox, dialogs):
+    """Where no approval pop-up exists (Linux, a remote machine): tell the person through what is there.
+
+    A desktop notification if there is a desktop, and a notification escape plus a bell on the person's
+    login terminals. Terminal apps such as iTerm2, kitty, WezTerm and Ghostty turn that escape into a
+    notification on the machine the person sits at, also through ssh; others ignore it.
+    """
+    seen = dialogs.setdefault("_reminded", {})
+    due = [k for k, e in inbox.items() if e.get("status") == "pending" and time.time() - seen.get(k, 0) > 1800]
+    if not due:
+        return
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", pending_summary(inbox))
+    if shutil.which("notify-send") and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        subprocess.Popen(["notify-send", "peers", text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for dev in login_ttys():
+        try:
+            fd = os.open(dev, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
+            try:
+                os.write(fd, f"\033]9;{text}\007\033]777;notify;peers;{text}\007\a".encode())
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+    for k in due:
+        seen[k] = time.time()
+
+
 def run_dialogs(cfg, inbox, reg, dialogs, changed):
     """Ask the person about pending messages, one dialog at a time. Only the background sync does this."""
     for key, proc in list(dialogs.items()):
-        if proc is None or proc.poll() is None:
+        if key == "_reminded" or proc is None or proc.poll() is None:
             continue
         answer = (proc.stdout.read() or "").strip()
         dialogs[key] = None
@@ -1045,7 +1100,10 @@ def run_dialogs(cfg, inbox, reg, dialogs, changed):
         if e and e.get("status") == "pending" and answer in ("Approve", "Deny"):
             e["status"], e["by"] = ("approved" if answer == "Approve" else "denied"), "dialog"
             changed.add(key)
-    if any(p is not None for p in dialogs.values()) or shutil.which("osascript") is None:
+    if shutil.which("osascript") is None:
+        remind_without_dialog(inbox, dialogs)
+        return
+    if any(p is not None for k, p in dialogs.items() if k != "_reminded"):
         return
     for key, e in inbox.items():
         if e.get("status") == "pending" and key not in dialogs:
@@ -1905,10 +1963,10 @@ def cmd_setup(a):
         cmd_live(argparse.Namespace(action="on", space=name, max_file_mb=None, budget_mb=None, force=False))
     if not a.no_skill:
         cmd_skill_install(argparse.Namespace(remove=False))
-    if not a.no_daemon and sys.platform == "darwin":
+    if not a.no_daemon:
         cmd_daemon_install(argparse.Namespace(remove=False))
-    elif not a.no_daemon:
-        print("Background sync: start `peers daemon` from your login scripts (automatic install is macOS only).")
+        if shutil.which("osascript") is None:  # no approval pop-up on this machine: use the status line instead
+            cmd_reminder_install(argparse.Namespace(remove=False))
     print(f"\nDone. Collaborators with access to the repo can now run:\n  peers follow {remote}\n"
           f"Change what is shared any time: peers ls / peers share / peers unshare / peers space auto {name} off")
 
@@ -2042,9 +2100,11 @@ def finish_install(a):
     """After following a project: the skill and the background sync, unless they are there already."""
     if not getattr(a, "no_skill", False) and not os.path.exists(skill_path()):
         cmd_skill_install(argparse.Namespace(remove=False))
-    plist = os.path.join(HOME, "Library", "LaunchAgents", LABEL + ".plist")
-    if not getattr(a, "no_daemon", False) and sys.platform == "darwin" and not os.path.exists(plist):
-        cmd_daemon_install(argparse.Namespace(remove=False))
+    if not getattr(a, "no_daemon", False):
+        if not daemon_installed():
+            cmd_daemon_install(argparse.Namespace(remove=False))
+        if shutil.which("osascript") is None:
+            cmd_reminder_install(argparse.Namespace(remove=False))
 
 
 def cmd_invite(a):
@@ -2282,6 +2342,9 @@ def cmd_update(a):
     if os.path.exists(plist):
         subprocess.run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{LABEL}"], capture_output=True)
         print("background sync restarted with the new version.")
+    if shutil.which("systemctl") and os.path.exists(os.path.join(HOME, ".config", "systemd", "user", "peers-sync.service")):
+        subprocess.run(["systemctl", "--user", "restart", "peers-sync.service"], capture_output=True)
+        print("background sync restarted with the new version.")
     if os.path.exists(skill_path()):  # the skill text ships with the tool; keep it in step
         subprocess.run([sys.executable, os.path.join(root, "peers.py"), "skill-install"], capture_output=True)
         print("Claude Code skill refreshed.")
@@ -2379,7 +2442,98 @@ PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 
+def cmd_statusline(a):
+    """For Claude Code's status line: one line when messages wait for approval, nothing otherwise."""
+    line = pending_summary(read_loose(INBOX, {}) or {})
+    if line:
+        print(line)
+
+
+def cmd_reminder_install(a):
+    """Show waiting messages in Claude Code's status line (the bar under the prompt in the terminal version)."""
+    import shlex
+    path = os.path.join(CLAUDE_HOME, "settings.json")
+    mine = f"{shlex.quote(sys.executable)} {shlex.quote(os.path.realpath(__file__))} statusline"
+    try:
+        cfg = json.load(open(path)) if os.path.exists(path) else {}
+    except ValueError:
+        die(f"{tilde(path)} could not be read as JSON. Add this status line command by hand: {mine}")
+    cur = cfg.get("statusLine") if isinstance(cfg.get("statusLine"), dict) else None
+    ours = bool(cur) and "statusline" in str(cur.get("command", "")) and "peers" in str(cur.get("command", ""))
+    if a.remove:
+        if ours:
+            del cfg["statusLine"]
+            with open(path, "w") as f:
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
+            print("status line reminder removed")
+        return
+    if ours:
+        return
+    if cur:
+        print(f"Claude Code already has a status line ({cur.get('command')}); it was left as it is.\n"
+              f"To show waiting messages there too, add the output of this command to your status line script:\n  {mine}")
+        return
+    if os.path.exists(path):
+        shutil.copyfile(path, path + ".before-peers")
+    cfg["statusLine"] = {"type": "command", "command": mine, "refreshInterval": 30}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    print("reminder installed: Claude Code's status line shows when a collaborator's message waits for your approval.")
+
+
+UNIT = """[Unit]
+Description=peers background sync
+
+[Service]
+ExecStart={python} {script} daemon
+Restart=always
+RestartSec=30
+Environment=PATH={path}
+StandardOutput=append:{log}
+StandardError=append:{log}
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def linux_daemon_install(a):
+    import getpass
+    unit = os.path.join(HOME, ".config", "systemd", "user", "peers-sync.service")
+    by_hand = "nohup peers daemon >> ~/.peers/daemon.log 2>&1 &"
+    if a.remove:
+        subprocess.run(["systemctl", "--user", "disable", "--now", "peers-sync.service"], capture_output=True)
+        if os.path.exists(unit):
+            os.remove(unit)
+        print("background sync removed")
+        return
+    load_config()
+    if not shutil.which("systemctl"):
+        die(f"this machine has no systemd. Start the sync yourself, for example: {by_hand}")
+    os.makedirs(os.path.dirname(unit), exist_ok=True)
+    os.makedirs(PEERS_HOME, exist_ok=True)
+    with open(unit, "w") as f:
+        f.write(UNIT.format(python=sys.executable, script=os.path.realpath(__file__), log=LOG,
+                            path=os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")))
+    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+    p = subprocess.run(["systemctl", "--user", "enable", "--now", "peers-sync.service"], capture_output=True, text=True)
+    if p.returncode != 0:
+        die("could not start it as a user service (" + (p.stderr or p.stdout).strip()[:200]
+            + f"). Start the sync yourself, for example: {by_hand}")
+    print(f"background sync installed and started (systemd user service peers-sync). Log: {LOG}")
+    if subprocess.run(["loginctl", "enable-linger", getpass.getuser()], capture_output=True).returncode != 0:
+        print(f"note: it stops when you log out. To keep it running: sudo loginctl enable-linger {getpass.getuser()}")
+
+
+def daemon_installed():
+    return os.path.exists(os.path.join(HOME, "Library", "LaunchAgents", LABEL + ".plist")) \
+        or os.path.exists(os.path.join(HOME, ".config", "systemd", "user", "peers-sync.service"))
+
+
 def cmd_daemon_install(a):
+    if sys.platform != "darwin":
+        return linux_daemon_install(a)
     label = LABEL
     plist = os.path.join(HOME, "Library", "LaunchAgents", label + ".plist")
     if a.remove:
@@ -2567,7 +2721,14 @@ def main():
     p = sub.add_parser("daemon", help="keep syncing (this is what the background service runs)")
     p.set_defaults(fn=cmd_daemon)
 
-    p = sub.add_parser("daemon-install", help="run the sync in the background at login (macOS launchd)")
+    p = sub.add_parser("statusline", help=argparse.SUPPRESS)
+    p.set_defaults(fn=cmd_statusline)
+    p = sub.add_parser("reminder-install", help="show waiting messages in Claude Code's status line "
+                                                 "(done automatically where there is no approval pop-up)")
+    p.add_argument("--remove", action="store_true")
+    p.set_defaults(fn=cmd_reminder_install)
+    p = sub.add_parser("daemon-install", help="run the sync in the background at login (launchd on macOS, "
+                                               "a systemd user service on Linux)")
     p.add_argument("--remove", action="store_true")
     p.set_defaults(fn=cmd_daemon_install)
 
