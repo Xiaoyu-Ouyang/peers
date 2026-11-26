@@ -28,7 +28,7 @@ CONFIG = os.path.join(PEERS_HOME, "config.json")
 STATE = os.path.join(PEERS_HOME, "state.json")
 LOG = os.path.join(PEERS_HOME, "daemon.log")
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 LABEL = "com.peers.sync"  # launchd label of the background sync
 
 PART_MAX = 200_000      # characters per part file before rolling to the next
@@ -327,11 +327,22 @@ class Exporter:
     rebuild from scratch gives byte-identical files to incremental updates.
     """
 
-    def __init__(self, outdir, st, shared_paths, outputs):
+    def __init__(self, outdir, st, shared_paths, outputs, private_paths=(), private_patterns=()):
         self.outdir = outdir
+        # output (or a relayed message) whose text matches one of these is never mirrored
+        self.private_text = [re.compile(x) for x in private_patterns]
         self.st = st
         self.shared_paths = shared_paths
         self.outputs = outputs
+        # A tool call that mentions a private folder (by full path, ~ path, or folder name) keeps its
+        # one-line summary but never its output. Erring towards hiding too much is intended.
+        self.private = []
+        for p in private_paths:
+            full = os.path.abspath(os.path.expanduser(p))
+            alts = [re.escape(full), re.escape(tilde(full))]
+            if len(os.path.basename(full)) >= 4:
+                alts.append(r"(?<![A-Za-z0-9_-])" + re.escape(os.path.basename(full)) + r"(?![A-Za-z0-9_-])")
+            self.private.append(re.compile("|".join(alts)))
         self.buf = {}  # part number -> [text]
         st.setdefault("offset", 0)
         st.setdefault("part", 0)
@@ -472,7 +483,7 @@ class Exporter:
             if via_peers:
                 who = f"collaborator {via_peers.group(2)} (peers message {via_peers.group(1)})"
             self.emit(f"\n**▸ {when[11:]} message from {who}**\n")
-            if self.outputs:
+            if self.outputs and not any(rx.search(body) for rx in self.private_text):
                 self.emit(f"\n<details><summary>message · {human_size(len(body))}</summary>\n\n{fenced(clip(body))}\n\n</details>\n")
         # anything else (hooks, reminders) is not shown
 
@@ -493,6 +504,10 @@ class Exporter:
             policy = "hide"  # connectors can return mail, chat, pages: never mirrored
         elif name == "Read" and not under(inp.get("file_path"), self.shared_paths):
             policy = "outside"
+        if policy == "show" and self.private:
+            blob = json.dumps(inp, ensure_ascii=False)
+            if any(rx.search(blob) for rx in self.private):
+                policy = "private"
         if b.get("id"):
             self.st["pending"][b["id"]] = [short_tool(name), policy]
         self.emit(f"\n**▸ {local_dt(ts)[11:]} {short_tool(name)}** {tool_summary(name, inp)}\n")
@@ -503,6 +518,9 @@ class Exporter:
             return
         if policy == "outside":
             self.emit("\n*(output not shared: the file is outside the shared folders)*\n")
+            return
+        if policy == "private":
+            self.emit("\n*(output not shared: it involves a folder marked private)*\n")
             return
         c = b.get("content")
         text, images = "", 0
@@ -521,14 +539,22 @@ class Exporter:
             text = (text + "\n" if text else "") + f"[{images} image(s) not mirrored]"
         if not text:
             return
+        if any(rx.search(text) for rx in self.private_text):
+            self.emit("\n*(output not shared: it matches a pattern marked private)*\n")
+            return
         err = " · error" if b.get("is_error") else ""
         self.emit(f"\n<details><summary>output · {name} · {human_size(len(text))}{err}</summary>\n\n"
                   f"{fenced(clip(text))}\n\n</details>\n")
 
 
-def export_session(sid, transcript, outdir, st, shared_paths, outputs, rebuild=False):
+def export_session(sid, transcript, outdir, st, shared_paths, outputs, rebuild=False, private_paths=(),
+                   private_patterns=()):
     """Bring outdir up to date with the transcript. Returns True if files changed."""
     settings = {"outputs": outputs, "shared_paths": sorted(shared_paths), "format": FORMAT}
+    if private_paths:
+        settings["private_paths"] = sorted(private_paths)
+    if private_patterns:
+        settings["private_patterns"] = sorted(private_patterns)
     if rebuild or st.get("settings") != settings or st.get("sid") != sid \
             or os.path.getsize(transcript) < st.get("offset", 0) \
             or (st.get("part", 0) and not os.path.exists(os.path.join(outdir, f"part-{st['part']:04d}.md"))):
@@ -536,7 +562,7 @@ def export_session(sid, transcript, outdir, st, shared_paths, outputs, rebuild=F
             os.remove(old)
         st.clear()
         st.update({"sid": sid, "settings": settings})
-    ex = Exporter(outdir, st, shared_paths, outputs)
+    ex = Exporter(outdir, st, shared_paths, outputs, private_paths, private_patterns)
     with open(transcript, "rb") as f:
         f.seek(st["offset"])
         while True:
@@ -718,7 +744,9 @@ def sync_space(cfg, states, name, space, reg, rebuild=None):
             opts["transcript"] = transcript
         st = spst.setdefault(sid, {})
         if export_session(sid, transcript, os.path.join(member_dir, sid[:8]), st, shared_paths,
-                          opts.get("outputs", True), rebuild=(rebuild in ("all", sid))):
+                          opts.get("outputs", True), rebuild=(rebuild in ("all", sid)),
+                          private_paths=space.get("private_paths", []),
+                          private_patterns=space.get("private_patterns", [])):
             changed.append(sid)
     # sessions that are no longer shared disappear from the mirror
     keep = {sid[:8] for sid in space.get("sessions", {})} | {"outbox", "receipts"}
@@ -1365,6 +1393,40 @@ def cmd_space_remove(a):
           "was left in place and nothing was changed on the remote.")
 
 
+def cmd_space_private(a):
+    with Lock():
+        cfg = load_config()
+        if a.name not in cfg.get("spaces", {}) or cfg["spaces"][a.name].get("view_only"):
+            die(f"no space of your own named {a.name!r}")
+        sp = cfg["spaces"][a.name]
+        cur = sp.setdefault("private_paths", [])
+        pats = sp.setdefault("private_patterns", [])
+        for x in a.pattern or []:
+            try:
+                re.compile(x)
+            except re.error as err:
+                die(f"not a valid pattern: {x!r} ({err})")
+            if a.remove:
+                if x in pats:
+                    pats.remove(x)
+            elif x not in pats:
+                pats.append(x)
+        for d in a.dir:
+            full = os.path.abspath(os.path.expanduser(d))
+            if a.remove:
+                if full in cur:
+                    cur.remove(full)
+            elif full not in cur:
+                cur.append(full)
+        save_json(CONFIG, cfg)
+    print(f"space '{a.name}': private folders are now: {', '.join(tilde(p) for p in cur) or '(none)'}; "
+          f"private patterns: {', '.join(pats) or '(none)'}\n"
+          "Output of tool calls that mention such a folder, or whose text matches such a pattern, is left out. Your shared transcripts are regenerated on the next "
+          "sync; what was already pushed stays in the repo's history.")
+    if not a.no_sync:
+        sync_all()
+
+
 def cmd_space_auto(a):
     with Lock():
         cfg = load_config()
@@ -1431,10 +1493,11 @@ def cmd_invite(a):
 def cmd_init(a):
     if not re.match(r"^[A-Za-z0-9_-]{1,32}$", a.me):
         die("name must be letters, digits, - or _")
-    cfg = load_json(CONFIG, {"spaces": {}})
-    cfg["me"] = a.me
-    cfg.setdefault("interval", 20)
-    save_json(CONFIG, cfg)
+    with Lock():
+        cfg = load_json(CONFIG, {"spaces": {}})
+        cfg["me"] = a.me
+        cfg.setdefault("interval", 20)
+        save_json(CONFIG, cfg)
     print(f"ok. You are '{a.me}'. Config: {CONFIG}")
 
 
@@ -1493,11 +1556,20 @@ def cmd_space_add(a):
             with open(exclude, "a") as f:
                 f.write(("" if have.endswith("\n") or not have else "\n") + rel + "\n")
     shared = [project] + [os.path.abspath(os.path.expanduser(p)) for p in (a.shared_path or [])]
-    old = cfg["spaces"].get(a.name, {})
-    cfg["spaces"][a.name] = {"dir": mirror, "remote": a.remote, "branch": branch, "shared_paths": shared,
-                             "push": not a.no_push, "view_only": a.view_only,
-                             "sessions": {} if a.view_only else old.get("sessions", {})}
-    save_json(CONFIG, cfg)
+    # Read, change and write the settings in one locked step: the background sync rewrites the same
+    # file every round, and an unlocked write here could be overwritten by its older copy.
+    with Lock():
+        cfg = load_config()
+        old = cfg["spaces"].get(a.name, {})
+        # re-running this for an existing space (for example to point it at another remote) keeps its other settings
+        cfg["spaces"][a.name] = dict(old, dir=mirror, remote=a.remote, branch=branch, shared_paths=shared,
+                                     push=not a.no_push, view_only=a.view_only,
+                                     sessions={} if a.view_only else old.get("sessions", {}))
+        for d in getattr(a, "private_path", None) or []:
+            full = os.path.abspath(os.path.expanduser(d))
+            if full not in cfg["spaces"][a.name].setdefault("private_paths", []):
+                cfg["spaces"][a.name]["private_paths"].append(full)
+        save_json(CONFIG, cfg)
     print(f"ok. Space '{a.name}': mirror at {tilde(mirror)} (branch '{branch}' of {a.remote}), "
           f"collaborators' sessions will appear there.")
     if a.view_only:
@@ -1753,6 +1825,8 @@ def main():
     p.add_argument("--project", required=True, help="project folder; the mirror is cloned to <project>/peers")
     p.add_argument("--shared-path", action="append",
                    help="extra folder whose files may appear in mirrored Read output (repeatable)")
+    p.add_argument("--private-path", action="append",
+                   help="folder (chat archive, notes) whose content must never appear in mirrored tool output (repeatable)")
     p.add_argument("--branch", default="main",
                    help="branch that holds the mirror. To keep it inside the project's own repo, "
                         "pass that repo as --remote and a dedicated branch here, e.g. sessions")
@@ -1766,6 +1840,15 @@ def main():
     p = ssub.add_parser("publish", help="start pushing a space that was added with --no-push")
     p.add_argument("name")
     p.set_defaults(fn=cmd_space_publish)
+    p = ssub.add_parser("private", help="mark folders (chat archives, notes) whose content must not appear in "
+                                         "mirrored tool output")
+    p.add_argument("name")
+    p.add_argument("dir", nargs="*")
+    p.add_argument("--pattern", action="append",
+                   help="regular expression; tool output whose text matches it is never mirrored (repeatable)")
+    p.add_argument("--remove", action="store_true")
+    p.add_argument("--no-sync", action="store_true")
+    p.set_defaults(fn=cmd_space_private)
     p = ssub.add_parser("remove", help="forget a space on this machine (its folder and the remote are left alone)")
     p.add_argument("name")
     p.set_defaults(fn=cmd_space_remove)

@@ -78,6 +78,12 @@ can hold mail, chat or web pages; the content of files read from outside the
 project folders (the path is shown). A session that runs outside the project
 folders is shared without any tool output unless you pass `--outputs on`.
 
+Folders that hold other people's words (a chat archive, private notes) should be
+marked private: `peers space private <space> <folder>`. Output of any tool call
+that mentions such a folder is then left out. `--pattern REGEX` does the same for
+output whose text matches, for example the line format a chat watcher prints.
+Claude's own replies are never filtered, so a reply that quotes a chat still shows.
+
 Strings that look like keys, tokens or passwords are replaced by `[REDACTED]`.
 That catches known formats only. Shell output is otherwise mirrored as printed, so
 do not share a session that printed something private. Unsharing removes a session
