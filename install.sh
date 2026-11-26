@@ -22,6 +22,7 @@ case ":$PATH:" in
 esac
 if [ "$1" = "--setup" ]; then
   # guided setup for the project in the folder this was started from
-  exec "$HOME/.local/bin/peers" setup
+  shift
+  exec "$HOME/.local/bin/peers" setup "$@"
 fi
 echo "next, inside your project folder: peers setup"
