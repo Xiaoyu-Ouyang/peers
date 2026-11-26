@@ -28,7 +28,7 @@ CONFIG = os.path.join(PEERS_HOME, "config.json")
 STATE = os.path.join(PEERS_HOME, "state.json")
 LOG = os.path.join(PEERS_HOME, "daemon.log")
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 LABEL = "com.peers.sync"  # launchd label of the background sync
 
 PART_MAX = 200_000      # characters per part file before rolling to the next
@@ -582,6 +582,45 @@ def export_session(sid, transcript, outdir, st, shared_paths, outputs, rebuild=F
 
 # ---------------------------------------------------------------- the index
 
+def first_prompt(path):
+    """The first thing the person typed in a session, shortened: a readable stand-in for a missing title."""
+    try:
+        with open(path, "rb") as f:
+            lines = f.read(800_000).decode("utf-8", "replace").split("\n")
+    except OSError:
+        return ""
+    for line in lines:
+        if '"type":"user"' not in line.replace('": "', '":"'):
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        c = (r.get("message") or {}).get("content")
+        if isinstance(c, list):
+            c = " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+        if not isinstance(c, str) or r.get("isMeta") or r.get("isCompactSummary") or _origin(r) not in (None, "human"):
+            continue
+        c = _REMINDER.sub("", c).strip()
+        if c and not c.startswith("<"):
+            return redact(oneline(c, 60))
+    return ""
+
+
+def nice_title(info, st, transcript=None):
+    """The session's descriptive title. In the terminal version of Claude Code a session often has only an
+    automatic handle (folder name plus a short suffix, like work-dd); then the first prompt says more."""
+    best = st.get("title") or (info or {}).get("name") or ""
+    base = os.path.basename((st.get("cwd") or (info or {}).get("cwd") or "").rstrip("/"))
+    auto = bool(best and base) and re.fullmatch(re.escape(base) + r"-[a-z0-9]{1,3}", best) is not None
+    if not best or auto:
+        if "first_user" not in st and transcript:
+            st["first_user"] = first_prompt(transcript)
+        if st.get("first_user"):
+            return f"{st['first_user']} ({best})" if best else st["first_user"]
+    return best or "(untitled)"
+
+
 def write_index(member_dir, me, sessions, states, reg):
     lines = [f"# {me}: shared Claude sessions", "",
              "Read-only mirror of the sessions this person chose to share. Newest activity first.",
@@ -597,7 +636,7 @@ def write_index(member_dir, me, sessions, states, reg):
     for _, sid, st in sorted(rows, reverse=True):
         info = reg.get(sid)
         state = {"busy": "working", "idle": "waiting for input"}.get((info or {}).get("status"), "open") if info else "not running"
-        title = oneline((info or {}).get("name") or st.get("title") or "(untitled)", 80).replace("|", "/")
+        title = oneline(st.get("shown_title") or (info or {}).get("name") or st.get("title") or "(untitled)", 90).replace("|", "/")
         d = sid[:8]
         latest = f"{d}/part-{st['part']:04d}.md"
         lines.append(f"| [{title}]({latest}) | {state} | {local_dt(st.get('last_ts'))[:16]} | "
@@ -776,13 +815,16 @@ def sync_space(cfg, states, name, space, reg, rebuild=None, timed=False):
                 shutil.rmtree(full)
     for sid in [s for s in spst if s not in space.get("sessions", {})]:
         del spst[sid]
+    for sid, opts in space.get("sessions", {}).items():
+        if spst.get(sid):
+            spst[sid]["shown_title"] = nice_title(reg.get(sid), spst[sid], opts.get("transcript"))
     if space.get("sessions") or os.path.isdir(member_dir):
         write_index(member_dir, me, list(space.get("sessions", {})), spst, reg)
         # lets collaborators see which version wrote this folder, and learn that an update exists
         stamp = json.dumps({"tool": __version__, "format": FORMAT})
         # machine-readable list of what I share, so others can address a message to a session
-        listing = json.dumps([{"id": sid, "title": (reg.get(sid) or {}).get("name") or spst.get(sid, {}).get("title")
-                               or "(untitled)", "inbound": opts.get("inbound", "ask")}
+        listing = json.dumps([{"id": sid, "title": spst.get(sid, {}).get("shown_title") or (reg.get(sid) or {}).get("name")
+                               or spst.get(sid, {}).get("title") or "(untitled)", "inbound": opts.get("inbound", "ask")}
                               for sid, opts in space.get("sessions", {}).items()], ensure_ascii=False, indent=1)
         for fname, text in ((".peers.json", stamp), ("sessions.json", listing)):
             path = os.path.join(member_dir, fname)
