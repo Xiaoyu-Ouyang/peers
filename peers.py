@@ -28,7 +28,7 @@ CONFIG = os.path.join(PEERS_HOME, "config.json")
 STATE = os.path.join(PEERS_HOME, "state.json")
 LOG = os.path.join(PEERS_HOME, "daemon.log")
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 LABEL = "com.peers.sync"  # launchd label of the background sync
 
 PART_MAX = 200_000      # characters per part file before rolling to the next
@@ -712,12 +712,26 @@ def refresh_code(name, space, states):
                               GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=15"))
 
 
-def sync_space(cfg, states, name, space, reg, rebuild=None):
+def sync_space(cfg, states, name, space, reg, rebuild=None, timed=False):
     me = cfg["me"]
     mirror = space["dir"]
-    if not os.path.isdir(os.path.join(mirror, ".git")):
+    main_mode = space.get("mode") == "main"
+    if main_mode:
+        if not os.path.isdir(os.path.join(space.get("repo") or "", ".git")):
+            raise RuntimeError(f"the project repo {space.get('repo')} is missing")
+        os.makedirs(mirror, exist_ok=True)
+        ms = states.setdefault("_main", {}).setdefault(name, {})
+        # the background sync looks once a minute; a command you run yourself always does a round
+        due = not timed or time.time() - ms.get("at", 0) >= float(space.get("main", {}).get("interval", 60))
+        if space.get("view_only"):
+            if not due:
+                return "idle"
+            ms["at"] = time.time()
+            return main_round(cfg, name, space, ms)
+    elif not os.path.isdir(os.path.join(mirror, ".git")):
         raise RuntimeError(f"mirror folder {mirror} is missing; run: peers space add {name} ...")
-    refresh_code(name, space, states)
+    else:
+        refresh_code(name, space, states)
     if space.get("view_only"):
         branch = space.get("branch", "main")
         before = git(mirror, "rev-parse", "HEAD").stdout.strip()
@@ -777,6 +791,13 @@ def sync_space(cfg, states, name, space, reg, rebuild=None):
                 with open(path, "w") as f:
                     f.write(text)
     n = len(changed)
+    if main_mode:
+        # The records were written into the repo's peers/ folder above. Committing and pushing happens
+        # only if something actually changed, records or any other file.
+        if not due:
+            return "idle"
+        ms["at"] = time.time()
+        return main_round(cfg, name, space, ms)
     return git_sync(mirror, me, f"{me}: {n} session(s) updated" if n else f"{me}: index",
                     space.get("branch", "main"), space.get("push", True))
 
@@ -795,7 +816,7 @@ def sync_all(rebuild=None, quiet=False, dialogs=None):
         for name, space in cfg.get("spaces", {}).items():
             space.setdefault("sessions", {})
             try:
-                results[name] = sync_space(cfg, states, name, space, reg, rebuild)
+                results[name] = sync_space(cfg, states, name, space, reg, rebuild, timed=dialogs is not None)
             except Exception as e:
                 results[name] = f"FAILED: {e}"
         save_json(STATE, states)
@@ -1252,6 +1273,9 @@ SECRET_NAME = re.compile(r"(?i)^(\.env(\..*)?|.*\.pem|.*\.key|.*\.p12|.*\.pfx|id
                          r"credentials?(\..*)?|.*\.keychain(-db)?|secrets?(\..*)?)$")
 
 
+JUNK = re.compile(r"(^|/)(\.DS_Store|Thumbs\.db|__pycache__/.*|\.ipynb_checkpoints/.*|[^/]*\.py[co]|[^/]*\.sw[po]|[^/]*~)$")
+
+
 def norm_remote(url):
     m = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?/?$", (url or "").strip())
     return m.group(1).lower() if m else (url or "").strip().lower()
@@ -1311,6 +1335,8 @@ def live_plan(space, repo):
             skip("in a folder marked private", size)
         elif SECRET_NAME.match(os.path.basename(path)):
             skip("looks like a credential file", size)
+        elif JUNK.search(path):
+            skip("system or cache file", size)
         elif size > cap:
             skip(f"larger than {opts.get('max_file_mb', 20)} MB", size)
         else:
@@ -1486,6 +1512,199 @@ def cmd_live(a):
               f"delete it with: git push origin --delete live/{cfg['me']}")
 
 
+# ---------------------------------------------------------------- everything on one branch ("main mode")
+#
+# In this mode there are no extra branches. Session records live in the folder
+# peers/ of the project repo, and once a minute the tool commits whatever changed
+# in the repo (files and records) to the shared branch, takes in what others
+# pushed, and pushes. It is automatic `git add; git commit; git pull --rebase;
+# git push` with a size limit, a credential filter, and a stop on conflicts.
+
+def repo_busy(repo):
+    """Why the repo should be left alone right now, or None."""
+    gd = subprocess.run(["git", "-C", repo, "rev-parse", "--absolute-git-dir"], capture_output=True, text=True).stdout.strip()
+    if not gd:
+        return "it is not a git repo"
+    for f, why in (("rebase-merge", "a rebase is in progress"), ("rebase-apply", "a rebase is in progress"),
+                   ("MERGE_HEAD", "a merge is in progress"), ("CHERRY_PICK_HEAD", "a cherry-pick is in progress"),
+                   ("REVERT_HEAD", "a revert is in progress"), ("BISECT_LOG", "a bisect is in progress")):
+        if os.path.exists(os.path.join(gd, f)):
+            return why
+    if os.path.exists(os.path.join(gd, "index.lock")):
+        return "another git command is running"
+    return None
+
+
+def notify(title, text):
+    if shutil.which("osascript"):
+        subprocess.Popen(["osascript", "-e", "on run argv", "-e", "display notification (item 2 of argv) with title (item 1 of argv)",
+                          "-e", "end run", title, text[:240]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def main_round(cfg, name, space, st):
+    """Commit my changes to the shared branch, take in everyone else's, push. Returns a short status."""
+    repo, branch, me = space["repo"], space.get("branch", "main"), cfg["me"]
+    busy = repo_busy(repo)
+    if busy:
+        return "waiting: " + busy
+    cur = git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    if cur != branch:
+        return f"waiting: the repo is on branch '{cur}', not '{branch}'"
+    env = dict(os.environ, GIT_LITERAL_PATHSPECS="1", GIT_TERMINAL_PROMPT="0",
+               GIT_SSH_COMMAND=os.environ.get("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=15"))
+    if subprocess.run(["git", "-C", repo, "var", "GIT_AUTHOR_IDENT"], capture_output=True).returncode != 0:
+        env.update(GIT_AUTHOR_NAME=me, GIT_AUTHOR_EMAIL=f"{me}@peers.invalid",
+                   GIT_COMMITTER_NAME=me, GIT_COMMITTER_EMAIL=f"{me}@peers.invalid")
+
+    def g(*args, data=None, check=True):
+        p = subprocess.run(["git", "-C", repo, *args], env=env, input=data, capture_output=True, timeout=1800)
+        if check and p.returncode != 0:
+            raise RuntimeError(f"git {' '.join(args[:2])}: {(p.stderr or p.stdout).decode('utf-8', 'replace').strip()[:300]}")
+        return p
+
+    def problem(text):
+        if st.get("problem") != text:
+            st["problem"] = text
+            notify(f"peers: {name} needs you", text)
+        return "STOPPED: " + text
+
+    committed = 0
+    if not space.get("view_only"):
+        adds, dels, skipped = live_plan(dict(space, live=space.get("main", {})), repo)
+        st["skipped"] = {k: list(v) for k, v in skipped.items()}
+        if space.get("code"):  # a project I only follow: nothing but my own records folder is ever committed
+            mine = f"peers/{me}/"
+            adds = [(p_, s_) for p_, s_ in adds if p_.startswith(mine)]
+            dels = [p_ for p_ in dels if p_.startswith(mine)]
+        paths = [a for a, _ in adds] + dels
+        if paths:
+            data = "\0".join(paths).encode("utf-8", "surrogateescape")
+            g("add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul", data=data)
+            size = sum(s for _, s in adds)
+            c = g("commit", "-q", "--no-verify", "-m",
+                  f"peers: {me} auto-sync ({len(adds)} changed, {len(dels)} deleted, {size / 1e6:.1f} MB)",
+                  "--pathspec-from-file=-", "--pathspec-file-nul", data=data, check=False)
+            if c.returncode == 0:
+                committed = len(paths)
+            elif b"nothing to commit" not in c.stdout + c.stderr and b"no changes added" not in c.stdout + c.stderr:
+                raise RuntimeError("git commit: " + (c.stderr or c.stdout).decode("utf-8", "replace").strip()[:300])
+    f = g("fetch", "-q", "origin", branch, check=False)
+    if f.returncode != 0:
+        if b"couldn't find remote ref" in f.stderr:
+            behind, theirs = 0, None  # the branch does not exist on the remote yet
+        else:
+            raise RuntimeError("git fetch: " + f.stderr.decode("utf-8", "replace").strip()[:300])
+    else:
+        theirs = g("rev-parse", "FETCH_HEAD").stdout.decode().strip()
+        behind = int(g("rev-list", "--count", f"HEAD..{theirs}").stdout.decode().strip() or 0)
+    ahead = int(g("rev-list", "--count", f"{theirs}..HEAD").stdout.decode().strip() or 0) if theirs else 1
+    pulled = False
+    if behind:
+        if ahead == 0:
+            r = g("merge", "-q", "--ff-only", theirs, check=False)
+            if r.returncode != 0:
+                return problem("could not take in others' changes: " + (r.stderr or r.stdout).decode("utf-8", "replace").strip()[:160])
+        else:
+            # look for conflicts first, without touching any working file
+            mt = g("merge-tree", "--write-tree", "--name-only", "HEAD", theirs, check=False)
+            if mt.returncode == 1:
+                files = mt.stdout.decode("utf-8", "replace").split("\n")[1:]  # tree id, file names, blank line, notes
+                files = [x for x in (files[:files.index("")] if "" in files else files) if x.strip()]
+                return problem("you and someone else changed the same file(s): " + ", ".join(files[:5])
+                               + ". Combine them by hand (git pull --rebase), then syncing continues.")
+            r = g("rebase", "-q", "--autostash", theirs, check=False)
+            if r.returncode != 0:
+                g("rebase", "--abort", check=False)
+                return problem("could not combine with others' changes: " + (r.stderr or r.stdout).decode("utf-8", "replace").strip()[:160])
+        pulled = True
+    pushed = False
+    if (ahead or committed) and not space.get("view_only") and space.get("push", True):
+        p = g("push", "-q", "origin", f"HEAD:refs/heads/{branch}", check=False)
+        if p.returncode != 0:
+            err = p.stderr.decode("utf-8", "replace")
+            if "rejected" in err or "fetch first" in err:
+                return "will retry (someone pushed at the same moment)"
+            raise RuntimeError("git push: " + err.strip()[:300])
+        pushed = True
+    st.pop("problem", None)
+    st.update(last_ok=time.time(), committed=committed)
+    return "+".join(w for w, on in (("pushed", pushed), ("pulled", pulled)) if on) or "idle"
+
+
+def make_main_space(cfg, name, repo, remote, shared_paths, view_only=False, extra=None):
+    """Settings for a space that keeps everything on the repo's current branch."""
+    branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    if branch == "HEAD":
+        die(f"{tilde(repo)} is not on a branch (detached HEAD). Check out the branch to sync, then try again.")
+    mirror = os.path.join(repo, "peers")
+    os.makedirs(mirror, exist_ok=True)
+    readme = os.path.join(mirror, "README.md")
+    if not os.path.exists(readme):
+        with open(readme, "w") as f:
+            f.write(MIRROR_README)
+    # an earlier setup may have told git to ignore this folder; now it is part of the repo
+    exclude = os.path.join(git(repo, "rev-parse", "--absolute-git-dir").stdout.strip(), "info", "exclude")
+    if os.path.exists(exclude):
+        lines = open(exclude).read().split("\n")
+        kept = [x for x in lines if x.strip() not in ("/peers/", "peers/", "/peers")]
+        if kept != lines:
+            with open(exclude, "w") as f:
+                f.write("\n".join(kept))
+    old = cfg["spaces"].get(name, {})
+    sp = dict(old, mode="main", repo=repo, dir=mirror, remote=remote, branch=branch, shared_paths=shared_paths,
+              push=True, view_only=view_only, sessions={} if view_only else old.get("sessions", {}))
+    sp.setdefault("live", {})["enabled"] = False
+    sp.update(extra or {})
+    cfg["spaces"][name] = sp
+    return sp
+
+
+def cmd_space_to_main(a):
+    """Move a space from separate branches to a single branch: records go into <repo>/peers on the repo's branch."""
+    with Lock():
+        cfg = load_config()
+        if a.name not in cfg.get("spaces", {}):
+            die(f"no space named {a.name!r}")
+        sp = cfg["spaces"][a.name]
+        if sp.get("mode") == "main":
+            die(f"'{a.name}' already keeps everything on branch '{sp.get('branch')}'")
+        if sp.get("view_only"):
+            die("this is someone else's project that you only read; nothing to change")
+        repo = find_space_repo(sp)
+        if not repo:
+            die(f"found no git repo with the remote {sp.get('remote')} in {tilde(sp['shared_paths'][0])}")
+        busy = repo_busy(repo)
+        if busy:
+            die(f"{tilde(repo)}: {busy}. Finish that first.")
+        me, old_dir, old_branch = cfg["me"], sp["dir"], sp.get("branch", "sessions")
+        others = [d for d in os.listdir(old_dir) if os.path.isdir(os.path.join(old_dir, d)) and d not in (me, ".git")] \
+            if os.path.isdir(old_dir) else []
+        if os.path.isdir(os.path.join(old_dir, ".git")):
+            backup = os.path.join(PEERS_HOME, "old-mirrors", f"{a.name}-{time.strftime('%Y%m%d-%H%M%S')}")
+            os.makedirs(os.path.dirname(backup), exist_ok=True)
+            shutil.move(old_dir, backup)
+            print(f"the old mirror folder was moved to {tilde(backup)} (kept as a backup; delete it when you like)")
+        sp = make_main_space(cfg, a.name, repo, sp["remote"], sp["shared_paths"])
+        save_json(CONFIG, cfg)
+        states = load_json(STATE, {})
+        states.pop(a.name, None)  # records are written afresh into the new folder
+        save_json(STATE, states)
+    print(f"'{a.name}' now keeps everything on branch '{sp['branch']}' of {tilde(repo)}: session records in "
+          f"{tilde(sp['dir'])}, and every change in the repo is committed and pushed about once a minute.")
+    res = sync_all()
+    stale = [old_branch, f"live/{me}"]
+    if str(res.get(a.name, "")).startswith(("FAILED", "STOPPED", "waiting")):
+        print("the first round did not complete (see above); the old branches were left in place.")
+    elif others:
+        print(f"other people ({', '.join(others)}) still use the branch '{old_branch}'; it was left in place.")
+    elif a.keep_branches:
+        print("the old branches were left in place: " + ", ".join(stale))
+    else:
+        for b in stale:
+            p = git(repo, "push", "-q", "origin", "--delete", b, check=False)
+            print(f"old branch '{b}': " + ("deleted on the remote" if p.returncode == 0 else "was not there"))
+
+
 # ---------------------------------------------------------------- onboarding: setup, follow, skill, invite
 
 SKILL_MD = '''---
@@ -1507,6 +1726,8 @@ exist, where each mirror folder is, and whether the background sync is running.
   `<name>/INDEX.md` first: title, state and latest messages of each shared session.
   The transcript is in `<name>/<session id>/part-NNNN.md`, oldest part first; the
   highest number is the newest. Read the latest part, or search the parts for a keyword.
+- Most projects keep everything on one branch: the records are then the folder `peers/` inside the
+  project repo itself, and other people's files arrive in the repo by themselves about once a minute.
 - For a followed repo, `peers status` also shows where its files are checked out.
 - A person's uncommitted work: if `<name>/live.json` exists in the mirror, the branch `live/<name>`
   of the project repo is their last commit plus everything not committed yet. Fetch it and read it
@@ -1520,6 +1741,9 @@ exist, where each mirror folder is, and whether the background sync is running.
 - `peers share current` shares the session you are running in. `peers ls` lists
   recent sessions; `peers share <id or part of title>` shares another one.
 - `peers unshare current` stops it. Copies others already pulled cannot be recalled.
+- In a project on one branch, every change in the repo (not only records) is committed and pushed
+  automatically about once a minute. Do not also commit the same files by hand in a hurry: if a commit
+  of yours finds "nothing to commit", the automatic sync got there first, which is fine.
 - Sharing shows collaborators the user's messages, Claude's replies, tool calls and
   shortened tool output, from the start of the session. Say so before sharing a
   session the user did not explicitly name.
@@ -1586,7 +1810,9 @@ def cmd_setup(a):
         die(f"{project} has no git remote. Push the project to a private GitHub repo first, or pass --remote URL.")
     name = a.name or re.sub(r"[^A-Za-z0-9_.-]", "-", os.path.basename(project))
     cands = [s for s in recent_sessions(300) if under(s["cwd"], [project])][:40]
-    print(f"\nProject: {tilde(project)}\nMirror:  branch '{a.branch}' of {remote}\n"
+    one_branch = top.returncode == 0 and not a.separate_branches
+    where = "folder peers/ on the repo's own branch" if one_branch else f"branch '{a.branch}'"
+    print(f"\nProject: {tilde(project)}\nRecords: {where} of {remote}\n"
           "         everyone who can open that repo will be able to read what you share.\n")
     if cands:
         print("Sessions that ran in this folder:")
@@ -1608,15 +1834,23 @@ def cmd_setup(a):
                 chosen.append(resolve_session(tok)[0])
     print(f"\nAbout to: share {len(chosen)} existing session(s); "
           + ("share sessions you start in this folder from now on automatically; " if not a.no_auto else "")
-          + ("" if a.no_live else "push this repo's working files (last commit plus uncommitted changes, files up to "
+          + ("check this repo once a minute and, when anything changed, commit it to the repo's own branch, take in "
+             "what others pushed, and push (files up to 20 MB, .gitignore respected); " if one_branch else
+             "" if a.no_live else "push this repo's working files (last commit plus uncommitted changes, files up to "
              "20 MB, .gitignore respected) to the branch live/" + me + " every minute; ")
           + "keep them synced in the background; teach Claude Code the /peers skill.\n"
           "Shared sessions show your messages, Claude's replies, tool calls and shortened tool output.")
     if not a.yes and (ask("Go ahead? y/n", "y") or "").lower() not in ("y", "yes"):
         die("nothing was changed.")
     cmd_init(argparse.Namespace(me=me))
-    cmd_space_add(argparse.Namespace(name=name, remote=remote, project=project, branch=a.branch, shared_path=None,
-                                     no_push=False, view_only=False, dir=None))
+    if one_branch:
+        with Lock():
+            cfg = load_config()
+            make_main_space(cfg, name, project, remote, [project])
+            save_json(CONFIG, cfg)
+    else:
+        cmd_space_add(argparse.Namespace(name=name, remote=remote, project=project, branch=a.branch, shared_path=None,
+                                         no_push=False, view_only=False, dir=None))
     with Lock():
         cfg = load_config()
         if not a.no_auto:
@@ -1625,7 +1859,7 @@ def cmd_setup(a):
     if chosen:
         cmd_share(argparse.Namespace(session=chosen, space=name, outputs="auto", no_sync=True))
     sync_all()
-    if not a.no_live and find_space_repo(load_config()["spaces"][name]):
+    if not one_branch and not a.no_live and find_space_repo(load_config()["spaces"][name]):
         cmd_live(argparse.Namespace(action="on", space=name, max_file_mb=None, budget_mb=None, force=False))
     if not a.no_skill:
         cmd_skill_install(argparse.Namespace(remove=False))
@@ -1714,7 +1948,25 @@ def cmd_follow(a):
     if ls.returncode != 0:
         die("cannot reach that repo (no access, or wrong URL): " + ls.stderr.strip()[:200])
     if not ls.stdout.strip():
-        die(f"that repo has no '{a.branch}' branch: its owner has not set up peers yet. Ask them to run: peers setup")
+        # no separate branch: the project keeps its records in the folder peers/ on its own branch
+        code = os.path.join(base, "code")
+        if not os.path.isdir(os.path.join(code, ".git")):
+            print(f"getting the project into {tilde(code)} (latest version only; can take a while for a large repo) ...")
+            p = subprocess.run(["git", "clone", "-q", "--depth", "1", a.url, code], capture_output=True, text=True)
+            if p.returncode != 0:
+                die("could not get the project: " + p.stderr.strip()[:300])
+        if not os.path.isdir(os.path.join(code, "peers")):
+            die("that project has no peers/ folder and no 'sessions' branch: its owner has not set up peers yet. "
+                "Ask them to run: peers setup")
+        with Lock():
+            cfg = load_config()
+            make_main_space(cfg, name, code, a.url, [base], view_only=a.view_only, extra={"code": code})
+            save_json(CONFIG, cfg)
+        print(f"\nFollowing {a.url}\n  everything is in {tilde(code)}; shared sessions are in its folder peers/ "
+              "(start with peers/<name>/INDEX.md)\nIt refreshes by itself while the background sync runs. "
+              "See addresses for messages with: peers who")
+        sync_all(quiet=True)
+        return
     code = os.path.join(base, "code")
     if not a.no_code and not os.path.isdir(os.path.join(code, ".git")):
         print(f"getting the project files into {tilde(code)} (latest version only; can take a while for a large repo) ...")
@@ -1981,6 +2233,8 @@ def cmd_status(a):
     newer = set()
     for name, space in cfg.get("spaces", {}).items():
         mode = "view-only" if space.get("view_only") else "publishing" if space.get("push", True) else "preview, not pushed"
+        if space.get("mode") == "main":
+            mode = ("read-only copy of" if space.get("view_only") else "everything on") + f" branch '{space.get('branch')}'"
         if space.get("auto_share"):
             mode += ", new sessions shared automatically"
         print(f"\nspace {name} [{mode}]: {tilde(space['dir'])}  <->  {space.get('remote')} ({space.get('branch', 'main')})")
@@ -1988,6 +2242,11 @@ def cmd_status(a):
             print(f"  their project files: {tilde(space['code'])}")
         if space.get("live", {}).get("enabled"):
             print(f"  live files: on, branch live/{cfg['me']} of {tilde(space['live'].get('repo'))}")
+        ms = states.get("_main", {}).get(name, {})
+        if ms.get("problem"):
+            print(f"  STOPPED: {ms['problem']}")
+        for why, (n_, b_) in sorted((ms.get("skipped") or {}).items()):
+            print(f"  not committed: {n_} file(s), {b_ / 1e6:.1f} MB, {why}")
         for sid, opts in space.get("sessions", {}).items():
             st = states.get(name, {}).get(sid, {})
             title = (reg.get(sid) or {}).get("name") or st.get("title") or "(untitled)"
@@ -2124,6 +2383,11 @@ def main():
     p.add_argument("--remove", action="store_true")
     p.add_argument("--no-sync", action="store_true")
     p.set_defaults(fn=cmd_space_private)
+    p = ssub.add_parser("to-main", help="keep everything on the repo's own branch instead of separate branches")
+    p.add_argument("name")
+    p.add_argument("--keep-branches", action="store_true",
+                   help="do not delete the old 'sessions' and 'live/<you>' branches on the remote")
+    p.set_defaults(fn=cmd_space_to_main)
     p = ssub.add_parser("remove", help="forget a space on this machine (its folder and the remote are left alone)")
     p.add_argument("name")
     p.set_defaults(fn=cmd_space_remove)
@@ -2139,7 +2403,10 @@ def main():
     p.add_argument("--branch", default="sessions")
     p.add_argument("--share", help="existing sessions to share: 'all', 'none', or ids/numbers separated by commas")
     p.add_argument("--no-auto", action="store_true", help="do not share new sessions automatically")
-    p.add_argument("--no-live", action="store_true", help="do not push working files to the branch live/<you>")
+    p.add_argument("--no-live", action="store_true", help="with --separate-branches: do not push working files")
+    p.add_argument("--separate-branches", action="store_true",
+                   help="keep records on a 'sessions' branch and working files on 'live/<you>', "
+                        "instead of committing everything to the repo's own branch")
     p.add_argument("--no-daemon", action="store_true", help="do not install the background sync")
     p.add_argument("--no-skill", action="store_true", help="do not install the Claude Code skill")
     p.add_argument("--yes", action="store_true", help="do not ask for confirmation")

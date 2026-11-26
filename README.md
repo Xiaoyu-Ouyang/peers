@@ -3,9 +3,11 @@
 For people who work on a project together, each with their own Claude Code.
 
 - **See each other's sessions.** You choose which of your Claude Code sessions are
-  shared. A filtered copy of each transcript is pushed to a branch of the project's
-  git repo every 20 seconds while the session is active. Whoever can open the repo
-  can read it, and so can their Claude.
+  shared. A filtered copy of each transcript is kept in the folder `peers/` of the
+  project's git repo. Whoever can open the repo can read it, and so can their Claude.
+- **Keep the repo itself in sync.** Once a minute the tool looks at the repo. If
+  anything changed, a session record or any other file, it commits the change to
+  the repo's branch, takes in what others pushed, and pushes. No change, no commit.
 - **Message each other's sessions.** A collaborator's Claude can send a question to
   one of your shared sessions and get the answer back. By default every message
   waits for your approval.
@@ -91,22 +93,42 @@ do not share a session that printed something private. Unsharing removes a sessi
 from the current version of the mirror; copies others already pulled, and the
 repo's history, keep what was sent.
 
-## Working files
+## What it does to your repo
 
-`peers live on <space>` (on by default after `peers setup`) pushes the working
-state of the project's git repo once a minute to the branch `live/<you>`: your
-last commit plus everything you have not committed yet. `main`, your history and
-your local uncommitted state are never touched, and `.gitignore` is respected.
+After `peers setup`, the background sync runs this once a minute, and only when
+something changed:
 
-Left out: files larger than 20 MB (`--max-file-mb` changes that), files that look
-like credentials (`.env`, `*.pem`, `*.key` and similar), folders marked private,
-and anything beyond 1,000 MB of changed files in total (`--budget-mb`).
-`peers live plan <space>` shows what would be pushed without pushing;
-`peers live status` shows what is out there and what was left out.
+1. writes your shared session records into `peers/<you>/`;
+2. commits every changed file of the repo (records included) to the branch you
+   are on, as `peers: <you> auto-sync`;
+3. takes in what others pushed (`git pull --rebase`), then pushes.
 
-Collaborators read it on GitHub, or in their clone with
-`git fetch origin live/<you>` and `git diff main origin/live/<you> --stat`.
-Half-finished work becomes visible to them: that is the point, and the price.
+It respects `.gitignore` and leaves out files larger than 20 MB, files that look
+like credentials (`.env`, `*.pem`, `*.key` and similar), system and cache files
+(`.DS_Store`, `__pycache__`), and folders marked private. `peers status` lists
+what was left out.
+
+Things to know:
+
+- Unfinished work goes into the branch's history as you make it, and stays there.
+- People who change different files never notice each other. If two people change
+  the same file, the tool stops for that repo, shows a notification, and touches
+  nothing; combine the two versions by hand (`git pull --rebase`) and it continues.
+- It waits while you are on another branch, in the middle of a rebase or merge,
+  or while another git command is running.
+- In a project you only follow (`peers follow`), the only thing ever committed
+  from your side is your own `peers/<you>/` folder, which carries your messages.
+
+## Separate branches instead
+
+`peers setup --separate-branches` keeps the repo's own branch untouched: records
+go to a branch `sessions`, and `peers live on <space>` pushes the working state
+(your last commit plus everything not committed yet) once a minute to the branch
+`live/<you>`. `peers space to-main <space>` switches such a space to the single
+branch layout.
+
+The same size and credential limits apply. `peers live plan <space>` shows what
+would be pushed without pushing anything.
 
 ## Messages
 
@@ -129,9 +151,11 @@ Half-finished work becomes visible to them: that is the point, and the price.
 
 ## Where the mirror lives
 
-**A dedicated branch of the project's own repo** (what `peers setup` does). No new
-repo, no new invitations. The branch (`sessions`) has no history in common with
-the code, and `main` is never touched.
+**The folder `peers/` of the project's own repo, on its own branch** (what
+`peers setup` does). No new repo, no new branches, no new invitations.
+
+**A dedicated branch of the project's own repo** (`--separate-branches`). The
+branch `sessions` has no history in common with the code, and `main` is never touched.
 
 **A separate private repo**, when the people who may see sessions differ from the
 people who may see the code, or when a project spans several repos:
@@ -143,8 +167,8 @@ peers space add myproject --remote git@github.com:OWNER/myproject-sessions.git -
 Add `--no-push` to look at the result locally first; `peers space publish <space>`
 starts pushing. Add `--view-only` to read a space without ever pushing to it.
 
-In your own project the mirror is the folder `peers/`, kept out of the project's
-git through `.git/info/exclude`.
+With separate branches or a separate repo, the mirror is still the folder `peers/`
+in your project, but kept out of the project's git through `.git/info/exclude`.
 
 ## Update
 
@@ -169,5 +193,5 @@ bump `__version__` in `peers.py`, commit, push.
 - Each person writes only under `<mirror>/<their-name>/`, so pushes never conflict.
 - Settings: `~/.peers/config.json`. Progress: `~/.peers/state.json`. Messages
   received: `~/.peers/inbox.json`. Background log: `~/.peers/daemon.log`.
-- Delay: Claude Code writes a record about a second after it happens, the sender
-  pushes within 20 seconds, the reader pulls within 20 seconds.
+- Delay: the sender pushes within a minute of a change, the reader pulls within a
+  minute (20 seconds each with separate branches).
