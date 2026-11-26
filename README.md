@@ -34,11 +34,7 @@ git clone https://github.com/Xiaoyu-Ouyang/peers.git ~/.peers/src && sh ~/.peers
 ```
 
 ```bash
-peers init --me yourname
-```
-
-```bash
-peers follow git@github.com:THEM/their-project.git
+peers follow git@github.com:THEM/their-project.git --me yourname
 ```
 
 Their files land in `~/peers/their-project/code`, their shared sessions in

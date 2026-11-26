@@ -28,7 +28,7 @@ CONFIG = os.path.join(PEERS_HOME, "config.json")
 STATE = os.path.join(PEERS_HOME, "state.json")
 LOG = os.path.join(PEERS_HOME, "daemon.log")
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 LABEL = "com.peers.sync"  # launchd label of the background sync
 
 PART_MAX = 200_000      # characters per part file before rolling to the next
@@ -1936,7 +1936,11 @@ def cmd_space_auto(a):
 
 def cmd_follow(a):
     """Someone else's project: get its files and its shared sessions, and keep both current."""
-    cfg = load_config()
+    cfg = load_json(CONFIG, None)
+    if not cfg or not cfg.get("me"):  # first use on this machine: one command is enough
+        guess = re.sub(r"[^A-Za-z0-9_-]", "", (os.environ.get("USER") or "me")).lower() or "me"
+        cmd_init(argparse.Namespace(me=a.me or ask("Your name, as collaborators will see it (letters, digits, - or _)", guess)))
+        cfg = load_config()
     name = a.name or re.sub(r"\.git$", "", a.url.rstrip("/").split("/")[-1].split(":")[-1])
     name = re.sub(r"[^A-Za-z0-9_.-]", "-", name)
     if name in cfg.get("spaces", {}) and cfg["spaces"][name].get("remote") != a.url:
@@ -1966,6 +1970,7 @@ def cmd_follow(a):
               "(start with peers/<name>/INDEX.md)\nIt refreshes by itself while the background sync runs. "
               "See addresses for messages with: peers who")
         sync_all(quiet=True)
+        finish_install(a)
         return
     code = os.path.join(base, "code")
     if not a.no_code and not os.path.isdir(os.path.join(code, ".git")):
@@ -1983,6 +1988,16 @@ def cmd_follow(a):
     print(f"\nFollowing {a.url}\n  files:    {tilde(code) if not a.no_code else '(not fetched)'}\n"
           f"  sessions: {tilde(os.path.join(base, 'sessions'))}  (start with <name>/INDEX.md)\n"
           "Both refresh by themselves while the background sync runs. See addresses for messages with: peers who")
+    finish_install(a)
+
+
+def finish_install(a):
+    """After following a project: the skill and the background sync, unless they are there already."""
+    if not getattr(a, "no_skill", False) and not os.path.exists(skill_path()):
+        cmd_skill_install(argparse.Namespace(remove=False))
+    plist = os.path.join(HOME, "Library", "LaunchAgents", LABEL + ".plist")
+    if not getattr(a, "no_daemon", False) and sys.platform == "darwin" and not os.path.exists(plist):
+        cmd_daemon_install(argparse.Namespace(remove=False))
 
 
 def cmd_invite(a):
@@ -1992,7 +2007,7 @@ def cmd_invite(a):
     own = {n: s for n, s in cfg.get("spaces", {}).items() if not s.get("view_only") and not s.get("code")}
     print("To see YOUR project (give them access to the repo on GitHub first), send them:\n")
     for n, s in own.items() or {"": {"remote": "<your project's repo URL>"}}.items():
-        print(f"  {install} && ~/.local/bin/peers init --me THEIR_NAME && ~/.local/bin/peers follow {s['remote']}\n")
+        print(f"  {install} && ~/.local/bin/peers follow {s['remote']} --me THEIR_NAME\n")
     print("To share THEIR project with you, they run this inside their project folder:\n")
     print(f"  {install} --setup\n")
     print("It asks their name and which sessions to share, then keeps everything synced. "
@@ -2419,6 +2434,9 @@ def main():
     p.add_argument("--into", help="folder to put it in (default: ~/peers/<name>)")
     p.add_argument("--no-code", action="store_true", help="only the sessions, not the project files")
     p.add_argument("--view-only", action="store_true", help="never push there (you cannot send messages through it)")
+    p.add_argument("--me", help="your name as collaborators see it (asked on first use if not given)")
+    p.add_argument("--no-daemon", action="store_true", help="do not install the background sync")
+    p.add_argument("--no-skill", action="store_true", help="do not install the Claude Code skill")
     p.set_defaults(fn=cmd_follow)
 
     p = sub.add_parser("invite", help="print what to send a collaborator so they can install and join")
