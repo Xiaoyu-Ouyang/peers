@@ -28,7 +28,7 @@ CONFIG = os.path.join(PEERS_HOME, "config.json")
 STATE = os.path.join(PEERS_HOME, "state.json")
 LOG = os.path.join(PEERS_HOME, "daemon.log")
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 LABEL = "com.peers.sync"  # launchd label of the background sync
 
 PART_MAX = 200_000      # characters per part file before rolling to the next
@@ -1959,6 +1959,11 @@ def cmd_follow(a):
             p = subprocess.run(["git", "clone", "-q", "--depth", "1", a.url, code], capture_output=True, text=True)
             if p.returncode != 0:
                 die("could not get the project: " + p.stderr.strip()[:300])
+        else:
+            # a copy from an earlier try: bring it up to date before looking (nobody works in this copy)
+            br = git(code, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+            if git(code, "fetch", "-q", "--depth", "1", "origin", br, check=False).returncode == 0:
+                git(code, "reset", "-q", "--hard", "FETCH_HEAD", check=False)
         if not os.path.isdir(os.path.join(code, "peers")):
             die("that project has no peers/ folder and no 'sessions' branch: its owner has not set up peers yet. "
                 "Ask them to run: peers setup")
