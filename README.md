@@ -58,6 +58,7 @@ The commands underneath:
 | `peers ls` | your recent sessions and which are shared |
 | `peers share <session>` / `peers unshare <session>` | `<session>` is `current`, the start of an id, or part of a title |
 | `peers space auto <space> on\|off` | share sessions started in the project folder automatically |
+| `peers live on\|off\|plan\|status <space>` | push working files to the branch `live/<you>` every minute |
 | `peers who` | sessions others share with you, as addresses |
 | `peers send <name>/<session> "text"` | message a collaborator's session |
 | `peers reply <id> "text"` | answer a message that was delivered to this session |
@@ -90,7 +91,22 @@ do not share a session that printed something private. Unsharing removes a sessi
 from the current version of the mirror; copies others already pulled, and the
 repo's history, keep what was sent.
 
-Project files are not mirrored by this tool. Others see them when you commit and push.
+## Working files
+
+`peers live on <space>` (on by default after `peers setup`) pushes the working
+state of the project's git repo once a minute to the branch `live/<you>`: your
+last commit plus everything you have not committed yet. `main`, your history and
+your local uncommitted state are never touched, and `.gitignore` is respected.
+
+Left out: files larger than 20 MB (`--max-file-mb` changes that), files that look
+like credentials (`.env`, `*.pem`, `*.key` and similar), folders marked private,
+and anything beyond 1,000 MB of changed files in total (`--budget-mb`).
+`peers live plan <space>` shows what would be pushed without pushing;
+`peers live status` shows what is out there and what was left out.
+
+Collaborators read it on GitHub, or in their clone with
+`git fetch origin live/<you>` and `git diff main origin/live/<you> --stat`.
+Half-finished work becomes visible to them: that is the point, and the price.
 
 ## Messages
 
