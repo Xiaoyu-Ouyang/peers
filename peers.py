@@ -28,7 +28,7 @@ CONFIG = os.path.join(PEERS_HOME, "config.json")
 STATE = os.path.join(PEERS_HOME, "state.json")
 LOG = os.path.join(PEERS_HOME, "daemon.log")
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 LABEL = "com.peers.sync"  # launchd label of the background sync
 
 PART_MAX = 200_000      # characters per part file before rolling to the next
@@ -1583,7 +1583,18 @@ def cmd_space_publish(a):
         cfg = load_config()
         if a.name not in cfg.get("spaces", {}):
             die(f"no space named {a.name!r}")
-        cfg["spaces"][a.name]["push"] = True
+        sp = cfg["spaces"][a.name]
+        mirror, branch = sp["dir"], sp.get("branch", "main")
+        ls = git(mirror, "ls-remote", "--heads", "origin", branch, check=False)
+        if ls.returncode != 0:
+            die("cannot reach the remote: " + (ls.stderr or ls.stdout).strip()[:300])
+        if not ls.stdout.strip() and int(git(mirror, "rev-list", "--count", "HEAD").stdout.strip() or 0) > 1:
+            # First publication: only the current state goes out. Whatever earlier preview versions
+            # contained (before folders were marked private, say) never leaves this machine.
+            fresh = git(mirror, "commit-tree", "HEAD^{tree}", "-m", "peers: start mirror").stdout.strip()
+            git(mirror, "reset", "-q", "--soft", fresh)
+            print("the preview's local history was dropped; only the current version is published.")
+        sp["push"] = True
         save_json(CONFIG, cfg)
     print(f"space '{a.name}' now pushes to its remote.")
     sync_all()
